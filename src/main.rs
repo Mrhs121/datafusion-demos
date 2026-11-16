@@ -70,7 +70,7 @@ fn normalize(sql: &str) -> String {
 }
 
 /// How a matching cube can answer the query.
-#[derive(Clone, Copy, PartialEq, Eq)]
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
 enum Mode {
     /// Only SUM over measures: scan the cube, no aggregate rewrite.
     Scan,
@@ -424,7 +424,12 @@ async fn build_data(root: &Path) -> Result<()> {
 }
 
 /// Run `sql` with table `sales` backed by `path`, printing the plan and timing.
-async fn run_scan(config: &SessionConfig, path: &Path, sql: &str) -> Result<Vec<RecordBatch>> {
+async fn run_scan(
+    config: &SessionConfig,
+    path: &Path,
+    sql: &str,
+    analyze: bool,
+) -> Result<Vec<RecordBatch>> {
     let ctx = new_context(config);
     register_sales(&ctx, path).await?;
 
@@ -432,7 +437,12 @@ async fn run_scan(config: &SessionConfig, path: &Path, sql: &str) -> Result<Vec<
     println!("scan: {}", path.display());
 
     // EXPLAIN shows the actual scan operator and file group.
-    // ctx.sql(&format!("EXPLAIN {sql}")).await?.show().await?;
+    let explain = if analyze {
+        format!("EXPLAIN ANALYZE {sql}")
+    } else {
+        format!("EXPLAIN {sql}")
+    };
+    ctx.sql(&explain).await?.show().await?;
 
     let started = Instant::now();
     let batches = ctx.sql(sql).await?.collect().await?;
@@ -448,12 +458,13 @@ async fn run_rewritten(
     cube: &Cube,
     plan: LogicalPlan,
     sql: &str,
+    analyze: bool,
 ) -> Result<Vec<RecordBatch>> {
     println!("\nSQL: {sql}");
     println!("scan: {} + aggregate rewrite", cube.path.display());
 
     let df = DataFrame::new(cube_ctx.state(), plan);
-    df.clone().explain(false, false)?.show().await?;
+    df.clone().explain(false, analyze)?.show().await?;
 
     let started = Instant::now();
     let batches = df.collect().await?;
@@ -494,15 +505,23 @@ async fn run_one(
     cube_ctx: &SessionContext,
     cube_scan: &LogicalPlan,
     base: &Path,
+    analyze: bool,
+    debug: bool,
 ) -> Result<()> {
     let plan = validator.state().create_logical_plan(sql).await?;
     let hit = if force_hit { Some(cube) } else { registry.hit(sql) };
     let mode = hit.and_then(|cube| cube_mode(cube, &plan));
 
+    if debug {
+        eprintln!("--- debug: original logical plan ---");
+        eprintln!("{}", plan.display_indent());
+        eprintln!("--- debug: hit={:?}, mode={mode:?} ---", hit.map(|cube| &cube.name));
+    }
+
     match (hit, mode) {
         (Some(cube), Some(Mode::Scan)) => {
             println!("\n=== HIT (scan): cube '{}' ===", cube.name);
-            let cube_batches = run_scan(config, &cube.path, sql).await?;
+            let cube_batches = run_scan(config, &cube.path, sql, analyze).await?;
             let base_batches = validator.sql(sql).await?.collect().await?;
             check_equal("scan", &cube_batches, &base_batches)?;
         }
@@ -510,17 +529,21 @@ async fn run_one(
             println!("\n=== HIT (aggregate rewrite): cube '{}' ===", cube.name);
             let rewritten = rewrite_with_cube(plan, cube, cube_scan)
                 .expect("cube_mode said the plan is rewriteable");
-            let cube_batches = run_rewritten(cube_ctx, cube, rewritten, sql).await?;
+            if debug {
+                eprintln!("--- debug: rewritten logical plan ---");
+                eprintln!("{}", rewritten.display_indent());
+            }
+            let cube_batches = run_rewritten(cube_ctx, cube, rewritten, sql, analyze).await?;
             let base_batches = validator.sql(sql).await?.collect().await?;
             check_equal("aggregate rewrite", &cube_batches, &base_batches)?;
         }
         (Some(_), None) => {
             println!("\n=== MISS: configured, but the cube cannot answer it ===");
-            run_scan(config, base, sql).await?;
+            run_scan(config, base, sql, analyze).await?;
         }
         (None, _) => {
             println!("\n=== MISS: no cube configured for this SQL ===");
-            run_scan(config, base, sql).await?;
+            run_scan(config, base, sql, analyze).await?;
         }
     }
     Ok(())
@@ -528,6 +551,10 @@ async fn run_one(
 
 #[tokio::main]
 async fn main() -> Result<()> {
+    env_logger::init();
+    let analyze = std::env::var_os("MINI_KYLIN_ANALYZE").is_some();
+    let debug = std::env::var_os("MINI_KYLIN_DEBUG").is_some();
+
     let root = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("data");
     build_data(&root).await?;
 
@@ -615,6 +642,8 @@ async fn main() -> Result<()> {
                     &cube_ctx,
                     &cube_scan,
                     &base,
+                    analyze,
+                    debug,
                 )
                 .await?;
             }
@@ -630,6 +659,8 @@ async fn main() -> Result<()> {
                 &cube_ctx,
                 &cube_scan,
                 &base,
+                analyze,
+                debug,
             )
             .await?;
         }
@@ -644,6 +675,8 @@ async fn main() -> Result<()> {
                 &cube_ctx,
                 &cube_scan,
                 &base,
+                analyze,
+                debug,
             )
             .await?;
         }
